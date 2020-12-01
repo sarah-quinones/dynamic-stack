@@ -110,13 +110,12 @@ static auto tag() -> _dynstack::tag_t<T>* {
   return nullptr;
 }
 
-struct dynamic_stack_view {
-private:
-  template <typename T>
-  struct dynamic_buffer;
-  template <typename T>
-  struct manually_managed_dynamic_buffer;
+template <typename T>
+struct dynamic_array;
+template <typename T>
+struct dynamic_alloc;
 
+struct dynamic_stack_view {
 public:
   dynamic_stack_view(void* data, std::size_t n_bytes) noexcept
       : m_data(data), m_rem_bytes(n_bytes) {}
@@ -131,7 +130,7 @@ public:
           -> _dynstack::enable_if_t<
               (std::is_default_constructible<T>::value &&
                std::is_destructible<T>::value),
-              dynamic_buffer<T>> {
+              dynamic_array<T>> {
     return {*this, len, align, _dynstack::zero_init_fn{}};
   }
   template <typename T>
@@ -145,7 +144,7 @@ public:
           -> _dynstack::enable_if_t<
               (std::is_default_constructible<T>::value &&
                std::is_destructible<T>::value),
-              dynamic_buffer<T>> {
+              dynamic_array<T>> {
     return {*this, len, align, _dynstack::zero_init_fn{}};
   }
 
@@ -159,7 +158,7 @@ public:
           -> _dynstack::enable_if_t<
               (std::is_default_constructible<T>::value &&
                std::is_destructible<T>::value),
-              dynamic_buffer<T>> {
+              dynamic_array<T>> {
     return {*this, len, align, _dynstack::default_init_fn{}};
   }
   template <typename T>
@@ -173,107 +172,120 @@ public:
           -> _dynstack::enable_if_t<
               (std::is_default_constructible<T>::value &&
                std::is_destructible<T>::value),
-              dynamic_buffer<T>> {
+              dynamic_array<T>> {
     return {*this, len, align, _dynstack::default_init_fn{}};
   }
 
   template <typename T>
   auto make_alloc(std::size_t len, std::size_t align = alignof(T)) noexcept
-      -> _dynstack::enable_if_t<
-          (std::is_destructible<T>::value),
-          manually_managed_dynamic_buffer<T>> {
+      -> _dynstack::
+          enable_if_t<(std::is_destructible<T>::value), dynamic_alloc<T>> {
     return {*this, len, align, _dynstack::no_init_fn{}};
   }
   template <typename T>
   auto make_alloc(
       _dynstack::tag_t<T>* (*/*unused*/)(),
       std::size_t len,
-      std::size_t align = alignof(T)) noexcept
-      -> _dynstack::enable_if_t<
-          (std::is_destructible<T>::value),
-          manually_managed_dynamic_buffer<T>> {
+      std::size_t align = alignof(T)) noexcept -> _dynstack::
+      enable_if_t<(std::is_destructible<T>::value), dynamic_alloc<T>> {
     return {*this, len, align, _dynstack::no_init_fn{}};
   }
 
 private:
-  template <typename T>
-  struct manually_managed_dynamic_buffer {
-    template <typename Fn>
-    manually_managed_dynamic_buffer(
-        dynamic_stack_view& parent,
-        std::size_t len,
-        std::size_t align,
-        Fn fn) noexcept(noexcept(T()))
-        : m_parent(parent), m_old_pos(parent.m_data) {
-
-      void* data = _dynstack::align_next(
-          align, len * sizeof(T), m_parent.m_data, m_parent.m_rem_bytes);
-
-      if (data != nullptr) {
-        m_len = len;
-        m_data = fn.template make<T>(data, len);
-      }
-    }
-
-    manually_managed_dynamic_buffer(manually_managed_dynamic_buffer const&) =
-        delete;
-    manually_managed_dynamic_buffer(
-        manually_managed_dynamic_buffer&& other) noexcept
-        : m_parent(other.m_parent),
-          m_old_pos(other.m_old_pos),
-          m_data(other.m_data),
-          m_len(other.m_len) {
-      other.m_len = 0;
-      other.m_data = nullptr;
-    };
-
-    auto operator=(manually_managed_dynamic_buffer)
-        -> manually_managed_dynamic_buffer& = delete;
-
-    auto data() const noexcept -> T* { return m_data; }
-    auto size() const noexcept -> std::size_t { return m_len; }
-
-  protected:
-    dynamic_stack_view& m_parent;
-    void* m_old_pos;
-    T* m_data = nullptr;
-    std::size_t m_len = 0;
-  };
-
-  template <typename T>
-  struct dynamic_buffer : private manually_managed_dynamic_buffer<T> {
-    using manually_managed_dynamic_buffer<T>::manually_managed_dynamic_buffer;
-    using manually_managed_dynamic_buffer<T>::data;
-    using manually_managed_dynamic_buffer<T>::size;
-    dynamic_buffer(dynamic_buffer const&) = delete;
-    dynamic_buffer(dynamic_buffer&&) noexcept = default;
-    auto operator=(dynamic_buffer) -> dynamic_buffer& = delete;
-
-    ~dynamic_buffer() {
-      if (this->m_len != 0) {
-        if (this->m_parent.m_data != (this->m_data + this->m_len)) {
-          // in case weird resources are reodered by moving ownership
-          std::terminate();
-        }
-        if (this->m_parent.m_data != (this->m_data + this->m_len)) {
-          if (static_cast<unsigned char*>(this->m_parent.m_data) <
-              static_cast<unsigned char*>(this->m_old_pos)) {
-            std::terminate(); // safety check
-          }
-        }
-        for (std::size_t i = 0; i < this->m_len; ++i) {
-          (this->m_data + i)->~T();
-        }
-        this->m_parent.m_rem_bytes += static_cast<std::size_t>(
-            static_cast<unsigned char*>(this->m_parent.m_data) -
-            static_cast<unsigned char*>(this->m_old_pos));
-        this->m_parent.m_data = this->m_old_pos;
-      }
-    }
-  };
-
   void* m_data;
   std::size_t m_rem_bytes;
+
+  template <typename T>
+  friend struct dynamic_alloc;
+  template <typename T>
+  friend struct dynamic_array;
+};
+
+template <typename T>
+struct dynamic_alloc {
+
+public:
+  ~dynamic_alloc() = default;
+  dynamic_alloc(dynamic_alloc const&) = delete;
+  dynamic_alloc(dynamic_alloc&& other) noexcept
+      : m_parent(other.m_parent),
+        m_old_pos(other.m_old_pos),
+        m_data(other.m_data),
+        m_len(other.m_len) {
+    other.m_len = 0;
+    other.m_data = nullptr;
+  };
+
+  auto operator=(dynamic_alloc const&) -> dynamic_alloc& = delete;
+  auto operator=(dynamic_alloc&&) -> dynamic_alloc& = delete;
+
+  auto data() const noexcept -> T* { return m_data; }
+  auto size() const noexcept -> std::size_t { return m_len; }
+
+private:
+  dynamic_stack_view& m_parent;
+  void* m_old_pos;
+  T* m_data = nullptr;
+  std::size_t m_len = 0;
+
+  friend struct dynamic_array<T>;
+  friend struct dynamic_stack_view;
+
+  template <typename Fn>
+  dynamic_alloc(
+      dynamic_stack_view& parent,
+      std::size_t len,
+      std::size_t align,
+      Fn fn) noexcept(noexcept(T()))
+      : m_parent(parent), m_old_pos(parent.m_data) {
+
+    void* data = _dynstack::align_next(
+        align, len * sizeof(T), m_parent.m_data, m_parent.m_rem_bytes);
+
+    if (data != nullptr) {
+      m_len = len;
+      m_data = fn.template make<T>(data, len);
+    }
+  }
+};
+
+template <typename T>
+struct dynamic_array : private dynamic_alloc<T> {
+
+public:
+  using dynamic_alloc<T>::data;
+  using dynamic_alloc<T>::size;
+
+  dynamic_array(dynamic_array const&) = delete;
+  dynamic_array(dynamic_array&&) noexcept = default;
+  auto operator=(dynamic_array const&) -> dynamic_array& = delete;
+  auto operator=(dynamic_array&&) -> dynamic_array& = delete;
+
+  ~dynamic_array() {
+    if (this->m_len != 0) {
+      if (this->m_parent.m_data != (this->m_data + this->m_len)) {
+        // in case weird resources are reodered by moving ownership
+        std::terminate();
+      }
+      if (this->m_parent.m_data != (this->m_data + this->m_len)) {
+        if (static_cast<unsigned char*>(this->m_parent.m_data) <
+            static_cast<unsigned char*>(this->m_old_pos)) {
+          std::terminate(); // safety check
+        }
+      }
+      for (std::size_t i = 0; i < this->m_len; ++i) {
+        (this->m_data + i)->~T();
+      }
+      this->m_parent.m_rem_bytes += static_cast<std::size_t>(
+          static_cast<unsigned char*>(this->m_parent.m_data) -
+          static_cast<unsigned char*>(this->m_old_pos));
+      this->m_parent.m_data = this->m_old_pos;
+    }
+  }
+
+private:
+  using dynamic_alloc<T>::dynamic_alloc;
+  friend struct dynamic_stack_view;
 };
 
 } // namespace veg
